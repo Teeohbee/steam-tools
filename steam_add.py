@@ -5,7 +5,9 @@
 
 Standard library only, so SteamOS updates can't break it.
 """
+import os
 import struct
+import zlib
 
 # Binary VDF: each value is <type byte> key\0 <payload>; a map ends with END.
 MAP, STRING, INT32, FLOAT32, UINT64, END = 0x00, 0x01, 0x02, 0x03, 0x07, 0x08
@@ -83,3 +85,39 @@ def _write_map(doc):
         else:
             raise TypeError("can't write %r = %r" % (key, value))
     return bytes(out + bytes([END]))
+
+
+def _get(entry, key):
+    """Steam isn't consistent about key case (appid, AppName, Exe, exe)."""
+    for k, v in entry.items():
+        if k.lower() == key.lower():
+            return k, v
+    return key, None
+
+
+def _quote(path):
+    return '"%s"' % path
+
+
+def upsert(doc, name, exe, icon=""):
+    """Add the shortcut for exe, or bring the existing one up to date. Returns (appid, changed)."""
+    shortcuts = doc.setdefault("shortcuts", {})
+    wanted = {"AppName": name, "Exe": _quote(exe), "StartDir": _quote(os.path.dirname(exe)), "icon": icon}
+    for entry in shortcuts.values():
+        if (_get(entry, "Exe")[1] or "").strip('"') != exe:
+            continue
+        changed = False
+        for key, value in wanted.items():
+            real_key, current = _get(entry, key)
+            if current != value:
+                entry[real_key] = value
+                changed = True
+        return _get(entry, "appid")[1], changed
+    appid = zlib.crc32((wanted["Exe"] + name).encode("utf-8")) | 0x80000000
+    shortcuts[str(len(shortcuts))] = {
+        "appid": appid, **wanted,
+        "ShortcutPath": "", "LaunchOptions": "", "IsHidden": 0, "AllowDesktopConfig": 1,
+        "AllowOverlay": 1, "OpenVR": 0, "Devkit": 0, "DevkitGameID": "", "DevkitOverrideAppID": 0,
+        "LastPlayTime": 0, "FlatpakAppID": "", "tags": {},
+    }
+    return appid, True
