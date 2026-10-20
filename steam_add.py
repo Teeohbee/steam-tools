@@ -5,8 +5,11 @@
 
 Standard library only, so SteamOS updates can't break it.
 """
+import copy
 import os
+import shutil
 import struct
+import time
 import zlib
 
 # Binary VDF: each value is <type byte> key\0 <payload>; a map ends with END.
@@ -99,10 +102,13 @@ def _quote(path):
     return '"%s"' % path
 
 
-def upsert(doc, name, exe, icon=""):
-    """Add the shortcut for exe, or bring the existing one up to date. Returns (appid, changed)."""
+def upsert(doc, name, exe, icon=None):
+    """Add the shortcut for exe, or bring the existing one up to date. Returns (appid, changed).
+    icon=None leaves the current icon alone."""
     shortcuts = doc.setdefault("shortcuts", {})
-    wanted = {"AppName": name, "Exe": _quote(exe), "StartDir": _quote(os.path.dirname(exe)), "icon": icon}
+    wanted = {"AppName": name, "Exe": _quote(exe), "StartDir": _quote(os.path.dirname(exe))}
+    if icon is not None:
+        wanted["icon"] = icon
     for entry in shortcuts.values():
         if (_get(entry, "Exe")[1] or "").strip('"') != exe:
             continue
@@ -115,9 +121,76 @@ def upsert(doc, name, exe, icon=""):
         return _get(entry, "appid")[1], changed
     appid = zlib.crc32((wanted["Exe"] + name).encode("utf-8")) | 0x80000000
     shortcuts[str(len(shortcuts))] = {
-        "appid": appid, **wanted,
+        "appid": appid, "icon": "", **wanted,
         "ShortcutPath": "", "LaunchOptions": "", "IsHidden": 0, "AllowDesktopConfig": 1,
         "AllowOverlay": 1, "OpenVR": 0, "Devkit": 0, "DevkitGameID": "", "DevkitOverrideAppID": 0,
         "LastPlayTime": 0, "FlatpakAppID": "", "tags": {},
     }
     return appid, True
+
+
+ART = {"cover": "%dp.png", "capsule": "%d.png", "hero": "%d_hero.png", "logo": "%d_logo.png", "icon": "%d_icon.png"}
+
+
+def install_art(art_dir, grid_dir, appid):
+    """Copy cover/capsule/hero/logo/icon.png into grid/ under Steam's names. Returns what changed."""
+    changed = []
+    for role, pattern in ART.items():
+        src = os.path.join(art_dir or "", role + ".png")
+        if not art_dir or not os.path.exists(src):
+            continue
+        dst = os.path.join(grid_dir, pattern % appid)
+        data = open(src, "rb").read()
+        if os.path.exists(dst) and open(dst, "rb").read() == data:
+            continue
+        os.makedirs(grid_dir, exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(data)
+        changed.append(dst)
+    return changed
+
+
+def _write_vdf(path, doc):
+    if os.path.exists(path):
+        shutil.copy2(path, "%s.bak-%s" % (path, time.strftime("%Y%m%d-%H%M%S")))
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(dumps(doc))
+    if loads(open(tmp, "rb").read()) != doc:
+        raise SystemExit("refusing to write %s: it didn't read back the same" % path)
+    os.replace(tmp, path)
+
+
+def _read_vdf(path):
+    if not os.path.exists(path):
+        return {"shortcuts": {}}
+    return loads(open(path, "rb").read())
+
+
+def run(name, exe, art_dir, userdata, steam):
+    for user in sorted(os.listdir(userdata)):
+        config = os.path.join(userdata, user, "config")
+        if not os.path.isdir(config):
+            continue
+        vdf = os.path.join(config, "shortcuts.vdf")
+        grid = os.path.join(config, "grid")
+        doc = _read_vdf(vdf)
+        appid, _ = upsert(copy.deepcopy(doc), name, exe)
+        icon = os.path.join(grid, ART["icon"] % appid)
+        has_icon = art_dir and os.path.exists(os.path.join(art_dir, "icon.png"))
+        icon = icon if has_icon else None
+        _, shortcut_changed = upsert(doc, name, exe, icon)
+        art_changed = install_art(art_dir, grid, appid)
+        if not shortcut_changed and not art_changed:
+            print("%s (user %s): up to date" % (name, user))
+            continue
+        if steam.game_running():
+            raise SystemExit("a game is running; quit it and run this again so Steam can restart")
+        steam.shutdown()
+        if shortcut_changed:
+            # Steam rewrote the file as it exited, so start again from what it left.
+            doc = _read_vdf(vdf)
+            upsert(doc, name, exe, icon)
+            _write_vdf(vdf, doc)
+        steam.wait_until_back()
+        print("%s (user %s): appid %d, updated" % (name, user, appid))
