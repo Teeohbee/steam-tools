@@ -5,10 +5,12 @@
 
 Standard library only, so SteamOS updates can't break it.
 """
+import argparse
 import copy
 import os
 import shutil
 import struct
+import subprocess
 import time
 import zlib
 
@@ -194,3 +196,46 @@ def run(name, exe, art_dir, userdata, steam):
             _write_vdf(vdf, doc)
         steam.wait_until_back()
         print("%s (user %s): appid %d, updated" % (name, user, appid))
+
+
+class Steam:
+    """The real Steam client, driven from an SSH session."""
+    CLIENT = "ubuntu12_32/steam"
+
+    def _running(self, pattern):
+        return subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL).returncode == 0
+
+    def game_running(self):
+        return self._running("SteamLaunch AppId=")
+
+    def shutdown(self):
+        subprocess.run(["steam", "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not self._wait(lambda: not self._running(self.CLIENT), 60):
+            raise SystemExit("Steam didn't shut down within 60 s; nothing was written")
+
+    def wait_until_back(self):
+        # Game Mode relaunches Steam by itself; Desktop Mode doesn't.
+        if not self._wait(lambda: self._running(self.CLIENT), 90):
+            print("Steam hasn't come back; start it yourself to see the changes")
+
+    def _wait(self, done, seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if done():
+                return True
+            time.sleep(1)
+        return False
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Add or update a non-Steam shortcut and its library art.")
+    parser.add_argument("name", help="name shown in the library")
+    parser.add_argument("exe", help="absolute path to the launcher")
+    parser.add_argument("art_dir", nargs="?", help="folder with cover/capsule/hero/logo/icon.png")
+    parser.add_argument("--userdata", default=os.path.expanduser("~/.local/share/Steam/userdata"))
+    args = parser.parse_args(argv)
+    run(args.name, os.path.abspath(args.exe), args.art_dir, args.userdata, Steam())
+
+
+if __name__ == "__main__":
+    main()
