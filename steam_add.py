@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Add or update a non-Steam shortcut on SteamOS, with its library art.
 
-    steam_add.py NAME EXE [ART_DIR]
+    python3 steam_add.py NAME EXE_PATH [ART_FOLDER]
 
 Standard library only, so SteamOS updates can't break it.
 """
 import argparse
-import copy
 import os
 import shutil
 import struct
@@ -14,10 +13,30 @@ import subprocess
 import time
 import zlib
 
-# Binary VDF: each value is <type byte> key\0 <payload>; a map ends with END.
-MAP, STRING, INT32, FLOAT32, UINT64, END = 0x00, 0x01, 0x02, 0x03, 0x07, 0x08
+# Steam's shortcuts.vdf is "binary VDF". Every value is written as:
+#   <one type byte> <key> 0x00 <the value>
+# A map is a list of values that ends with the END_OF_MAP byte.
+TYPE_MAP = 0x00
+TYPE_STRING = 0x01
+TYPE_INT32 = 0x02
+TYPE_FLOAT32 = 0x03
+TYPE_UINT64 = 0x07
+END_OF_MAP = 0x08
+
+STEAM_USERDATA_FOLDER = os.path.expanduser("~/.local/share/Steam/userdata")
+
+# Steam's file name for each piece of art, given the shortcut's appid.
+ART_FILE_NAMES = {
+    "cover": "{appid}p.png",
+    "capsule": "{appid}.png",
+    "hero": "{appid}_hero.png",
+    "logo": "{appid}_logo.png",
+    "icon": "{appid}_icon.png",
+}
 
 
+# Python has one int and one float type, but the file has several. These two
+# wrappers remember which type a number was read as, so it's written back the same way.
 class Float32(float):
     pass
 
@@ -26,215 +45,303 @@ class UInt64(int):
     pass
 
 
-def loads(data):
-    doc, pos = _read_map(data, 0)
-    if pos != len(data):
-        raise ValueError("trailing bytes after the top-level map")
-    return doc
+# --- Reading and writing binary VDF -------------------------------------------------
+
+def parse_vdf(file_bytes):
+    document, position = read_map(file_bytes, 0)
+    if position != len(file_bytes):
+        raise ValueError("unexpected bytes after the end of the file's top-level map")
+    return document
 
 
-def _read_cstr(data, pos):
-    end = data.find(b"\x00", pos)
-    if end < 0:
-        raise ValueError("unterminated string at byte %d" % pos)
-    return data[pos:end].decode("utf-8"), end + 1
+def read_null_terminated_string(file_bytes, position):
+    end = file_bytes.find(b"\x00", position)
+    if end == -1:
+        raise ValueError("a string starting at byte %d never ends" % position)
+    text = file_bytes[position:end].decode("utf-8")
+    position_after_string = end + 1
+    return text, position_after_string
 
 
-def _read_map(data, pos):
-    out = {}
+def read_map(file_bytes, position):
+    """Read values until END_OF_MAP. Returns the map and the position just after it."""
+    result = {}
     while True:
-        if pos >= len(data):
-            raise ValueError("file ends inside a map")
-        kind = data[pos]
-        pos += 1
-        if kind == END:
-            return out, pos
-        key, pos = _read_cstr(data, pos)
-        if kind == MAP:
-            out[key], pos = _read_map(data, pos)
-        elif kind == STRING:
-            out[key], pos = _read_cstr(data, pos)
-        elif kind == INT32:
-            out[key] = struct.unpack_from("<I", data, pos)[0]
-            pos += 4
-        elif kind == FLOAT32:
-            out[key] = Float32(struct.unpack_from("<f", data, pos)[0])
-            pos += 4
-        elif kind == UINT64:
-            out[key] = UInt64(struct.unpack_from("<Q", data, pos)[0])
-            pos += 8
+        if position >= len(file_bytes):
+            raise ValueError("the file ends in the middle of a map")
+        value_type = file_bytes[position]
+        position += 1
+        if value_type == END_OF_MAP:
+            return result, position
+
+        key, position = read_null_terminated_string(file_bytes, position)
+
+        if value_type == TYPE_MAP:
+            result[key], position = read_map(file_bytes, position)
+        elif value_type == TYPE_STRING:
+            result[key], position = read_null_terminated_string(file_bytes, position)
+        elif value_type == TYPE_INT32:
+            # "<I" means a little-endian unsigned 32-bit integer
+            result[key] = struct.unpack_from("<I", file_bytes, position)[0]
+            position += 4
+        elif value_type == TYPE_FLOAT32:
+            result[key] = Float32(struct.unpack_from("<f", file_bytes, position)[0])
+            position += 4
+        elif value_type == TYPE_UINT64:
+            result[key] = UInt64(struct.unpack_from("<Q", file_bytes, position)[0])
+            position += 8
         else:
-            raise ValueError("unknown type 0x%02x at byte %d" % (kind, pos - 1))
-        if pos > len(data):
-            raise ValueError("file ends inside %r" % key)
+            raise ValueError("unknown value type 0x%02x at byte %d" % (value_type, position - 1))
+
+        if position > len(file_bytes):
+            raise ValueError("the file ends in the middle of %r" % key)
 
 
-def dumps(doc):
-    return _write_map(doc)
+def serialise_vdf(document):
+    return write_map(document)
 
 
-def _write_map(doc):
-    out = bytearray()
-    for key, value in doc.items():
-        k = key.encode("utf-8") + b"\x00"
+def write_map(document):
+    output = bytearray()
+    for key, value in document.items():
+        key_bytes = key.encode("utf-8") + b"\x00"
+        # Check Float32 and UInt64 before plain int, because they are also ints/floats.
         if isinstance(value, dict):
-            out += bytes([MAP]) + k + _write_map(value)
+            output += bytes([TYPE_MAP]) + key_bytes + write_map(value)
         elif isinstance(value, str):
-            out += bytes([STRING]) + k + value.encode("utf-8") + b"\x00"
+            output += bytes([TYPE_STRING]) + key_bytes + value.encode("utf-8") + b"\x00"
         elif isinstance(value, Float32):
-            out += bytes([FLOAT32]) + k + struct.pack("<f", value)
+            output += bytes([TYPE_FLOAT32]) + key_bytes + struct.pack("<f", value)
         elif isinstance(value, UInt64):
-            out += bytes([UINT64]) + k + struct.pack("<Q", value)
+            output += bytes([TYPE_UINT64]) + key_bytes + struct.pack("<Q", value)
         elif isinstance(value, int):
-            out += bytes([INT32]) + k + struct.pack("<I", value & 0xFFFFFFFF)
+            output += bytes([TYPE_INT32]) + key_bytes + struct.pack("<I", value)
         else:
-            raise TypeError("can't write %r = %r" % (key, value))
-    return bytes(out + bytes([END]))
+            raise TypeError("don't know how to write %r = %r" % (key, value))
+    output += bytes([END_OF_MAP])
+    return bytes(output)
 
 
-def _get(entry, key):
-    """Steam isn't consistent about key case (appid, AppName, Exe, exe)."""
-    for k, v in entry.items():
-        if k.lower() == key.lower():
-            return k, v
-    return key, None
+# --- Shortcuts ----------------------------------------------------------------------
+
+def find_key_ignoring_case(shortcut, wanted_key):
+    """Steam isn't consistent about key case (appid, AppName, Exe or exe), so match any."""
+    for key in shortcut.keys():
+        if key.lower() == wanted_key.lower():
+            return key
+    return None
 
 
-def _quote(path):
-    return '"%s"' % path
+def value_ignoring_case(shortcut, wanted_key):
+    key = find_key_ignoring_case(shortcut, wanted_key)
+    if key is None:
+        return None
+    return shortcut[key]
 
 
-def upsert(doc, name, exe, icon=None):
-    """Add the shortcut for exe, or bring the existing one up to date. Returns (appid, changed).
-    icon=None leaves the current icon alone."""
-    shortcuts = doc.setdefault("shortcuts", {})
-    wanted = {"AppName": name, "Exe": _quote(exe), "StartDir": _quote(os.path.dirname(exe))}
-    if icon is not None:
-        wanted["icon"] = icon
-    for entry in shortcuts.values():
-        if (_get(entry, "Exe")[1] or "").strip('"') != exe:
-            continue
-        changed = False
-        for key, value in wanted.items():
-            real_key, current = _get(entry, key)
-            if current != value:
-                entry[real_key] = value
-                changed = True
-        return _get(entry, "appid")[1], changed
-    appid = zlib.crc32((wanted["Exe"] + name).encode("utf-8")) | 0x80000000
-    shortcuts[str(len(shortcuts))] = {
-        "appid": appid, "icon": "", **wanted,
-        "ShortcutPath": "", "LaunchOptions": "", "IsHidden": 0, "AllowDesktopConfig": 1,
-        "AllowOverlay": 1, "OpenVR": 0, "Devkit": 0, "DevkitGameID": "", "DevkitOverrideAppID": 0,
-        "LastPlayTime": 0, "FlatpakAppID": "", "tags": {},
+def in_quotes(path):
+    # Steam stores Exe and StartDir with quotes round them
+    return '"' + path + '"'
+
+
+def find_shortcut_by_exe(document, exe_path):
+    shortcuts = document.get("shortcuts", {})
+    for shortcut in shortcuts.values():
+        stored_exe = value_ignoring_case(shortcut, "Exe")
+        if stored_exe is not None and stored_exe.strip('"') == exe_path:
+            return shortcut
+    return None
+
+
+def appid_for(document, name, exe_path):
+    """An existing shortcut keeps its appid. A new one gets the usual crc32-based id."""
+    existing_shortcut = find_shortcut_by_exe(document, exe_path)
+    if existing_shortcut is not None:
+        return value_ignoring_case(existing_shortcut, "appid")
+    checksum = zlib.crc32((in_quotes(exe_path) + name).encode("utf-8"))
+    return checksum | 0x80000000
+
+
+def add_or_update_shortcut(document, name, exe_path, icon_path=None):
+    """Make the shortcut for exe_path match these settings. Returns True if anything changed.
+    icon_path=None leaves the shortcut's current icon alone."""
+    wanted_settings = {
+        "AppName": name,
+        "Exe": in_quotes(exe_path),
+        "StartDir": in_quotes(os.path.dirname(exe_path)),
     }
-    return appid, True
+    if icon_path is not None:
+        wanted_settings["icon"] = icon_path
+
+    existing_shortcut = find_shortcut_by_exe(document, exe_path)
+
+    if existing_shortcut is None:
+        new_shortcut = {
+            "appid": appid_for(document, name, exe_path),
+            "AppName": name,
+            "Exe": in_quotes(exe_path),
+            "StartDir": in_quotes(os.path.dirname(exe_path)),
+            "icon": icon_path if icon_path is not None else "",
+            "ShortcutPath": "",
+            "LaunchOptions": "",
+            "IsHidden": 0,
+            "AllowDesktopConfig": 1,
+            "AllowOverlay": 1,
+            "OpenVR": 0,
+            "Devkit": 0,
+            "DevkitGameID": "",
+            "DevkitOverrideAppID": 0,
+            "LastPlayTime": 0,
+            "FlatpakAppID": "",
+            "tags": {},
+        }
+        shortcuts = document.setdefault("shortcuts", {})
+        next_index = str(len(shortcuts))   # Steam keys its shortcuts "0", "1", "2", ...
+        shortcuts[next_index] = new_shortcut
+        return True
+
+    anything_changed = False
+    for setting, wanted_value in wanted_settings.items():
+        key_as_stored = find_key_ignoring_case(existing_shortcut, setting) or setting
+        if existing_shortcut.get(key_as_stored) != wanted_value:
+            existing_shortcut[key_as_stored] = wanted_value
+            anything_changed = True
+    return anything_changed
 
 
-ART = {"cover": "%dp.png", "capsule": "%d.png", "hero": "%d_hero.png", "logo": "%d_logo.png", "icon": "%d_icon.png"}
+# --- Files --------------------------------------------------------------------------
 
-
-def install_art(art_dir, grid_dir, appid):
-    """Copy cover/capsule/hero/logo/icon.png into grid/ under Steam's names. Returns what changed."""
-    changed = []
-    for role, pattern in ART.items():
-        src = os.path.join(art_dir or "", role + ".png")
-        if not art_dir or not os.path.exists(src):
-            continue
-        dst = os.path.join(grid_dir, pattern % appid)
-        data = open(src, "rb").read()
-        if os.path.exists(dst) and open(dst, "rb").read() == data:
-            continue
-        os.makedirs(grid_dir, exist_ok=True)
-        with open(dst, "wb") as f:
-            f.write(data)
-        changed.append(dst)
-    return changed
-
-
-def _write_vdf(path, doc):
-    if os.path.exists(path):
-        shutil.copy2(path, "%s.bak-%s" % (path, time.strftime("%Y%m%d-%H%M%S")))
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(dumps(doc))
-    if loads(open(tmp, "rb").read()) != doc:
-        raise SystemExit("refusing to write %s: it didn't read back the same" % path)
-    os.replace(tmp, path)
-
-
-def _read_vdf(path):
-    if not os.path.exists(path):
+def read_shortcuts_file(shortcuts_file):
+    if not os.path.exists(shortcuts_file):
         return {"shortcuts": {}}
-    return loads(open(path, "rb").read())
+    with open(shortcuts_file, "rb") as file:
+        return parse_vdf(file.read())
 
 
-def run(name, exe, art_dir, userdata, steam):
-    for user in sorted(os.listdir(userdata)):
-        config = os.path.join(userdata, user, "config")
-        if not os.path.isdir(config):
+def back_up_and_write_shortcuts_file(shortcuts_file, document):
+    if os.path.exists(shortcuts_file):
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(shortcuts_file, shortcuts_file + ".bak-" + timestamp)
+
+    # Write to a temporary file, check it reads back the same, then swap it in.
+    temporary_file = shortcuts_file + ".tmp"
+    with open(temporary_file, "wb") as file:
+        file.write(serialise_vdf(document))
+    with open(temporary_file, "rb") as file:
+        reads_back_the_same = parse_vdf(file.read()) == document
+    if not reads_back_the_same:
+        raise SystemExit("refusing to write %s: it didn't read back the same" % shortcuts_file)
+    os.replace(temporary_file, shortcuts_file)
+
+
+def copy_art_into_grid(art_folder, grid_folder, appid):
+    """Copy cover/capsule/hero/logo/icon.png into Steam's grid folder under Steam's names.
+    Skips missing and unchanged files. Returns the paths it actually wrote."""
+    files_written = []
+    if art_folder is None:
+        return files_written
+    for role, steam_file_name in ART_FILE_NAMES.items():
+        source = os.path.join(art_folder, role + ".png")
+        if not os.path.exists(source):
             continue
-        vdf = os.path.join(config, "shortcuts.vdf")
-        grid = os.path.join(config, "grid")
-        doc = _read_vdf(vdf)
-        appid, _ = upsert(copy.deepcopy(doc), name, exe)
-        icon = os.path.join(grid, ART["icon"] % appid)
-        has_icon = art_dir and os.path.exists(os.path.join(art_dir, "icon.png"))
-        icon = icon if has_icon else None
-        _, shortcut_changed = upsert(doc, name, exe, icon)
-        art_changed = install_art(art_dir, grid, appid)
+        destination = os.path.join(grid_folder, steam_file_name.format(appid=appid))
+        with open(source, "rb") as file:
+            new_contents = file.read()
+        if os.path.exists(destination):
+            with open(destination, "rb") as file:
+                if file.read() == new_contents:
+                    continue
+        os.makedirs(grid_folder, exist_ok=True)
+        with open(destination, "wb") as file:
+            file.write(new_contents)
+        files_written.append(destination)
+    return files_written
+
+
+# --- The whole job ------------------------------------------------------------------
+
+def add_to_steam(name, exe_path, art_folder, userdata_folder, steam):
+    """Add or update the shortcut and its art for every Steam user on this device."""
+    for steam_user_id in sorted(os.listdir(userdata_folder)):
+        config_folder = os.path.join(userdata_folder, steam_user_id, "config")
+        if not os.path.isdir(config_folder):
+            continue
+        shortcuts_file = os.path.join(config_folder, "shortcuts.vdf")
+        grid_folder = os.path.join(config_folder, "grid")
+
+        document = read_shortcuts_file(shortcuts_file)
+        appid = appid_for(document, name, exe_path)
+
+        icon_path = None   # None means: leave the shortcut's icon as it is
+        if art_folder is not None and os.path.exists(os.path.join(art_folder, "icon.png")):
+            icon_path = os.path.join(grid_folder, ART_FILE_NAMES["icon"].format(appid=appid))
+
+        shortcut_changed = add_or_update_shortcut(document, name, exe_path, icon_path)
+        art_files_written = copy_art_into_grid(art_folder, grid_folder, appid)
+        art_changed = len(art_files_written) > 0
+
         if not shortcut_changed and not art_changed:
-            print("%s (user %s): up to date" % (name, user))
+            print("%s (Steam user %s): already up to date" % (name, steam_user_id))
             continue
-        if steam.game_running():
+
+        # Steam only notices changes when it starts, so it has to restart.
+        if steam.is_game_running():
             raise SystemExit("a game is running; quit it and run this again so Steam can restart")
-        steam.shutdown()
+        steam.shut_down()
+
         if shortcut_changed:
-            # Steam rewrote the file as it exited, so start again from what it left.
-            doc = _read_vdf(vdf)
-            upsert(doc, name, exe, icon)
-            _write_vdf(vdf, doc)
-        steam.wait_until_back()
-        print("%s (user %s): appid %d, updated" % (name, user, appid))
+            # Steam rewrites shortcuts.vdf as it exits, so our edit is made now, to the file
+            # Steam has just left behind, rather than to the copy we read earlier.
+            document = read_shortcuts_file(shortcuts_file)
+            add_or_update_shortcut(document, name, exe_path, icon_path)
+            back_up_and_write_shortcuts_file(shortcuts_file, document)
+
+        steam.wait_until_running_again()
+        print("%s (Steam user %s): updated, appid %d" % (name, steam_user_id, appid))
 
 
 class Steam:
     """The real Steam client, driven from an SSH session."""
-    CLIENT = "ubuntu12_32/steam"
+    CLIENT_PROCESS = "ubuntu12_32/steam"
+    RUNNING_GAME_PROCESS = "SteamLaunch AppId="
 
-    def _running(self, pattern):
-        return subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL).returncode == 0
+    def is_game_running(self):
+        return self.process_is_running(self.RUNNING_GAME_PROCESS)
 
-    def game_running(self):
-        return self._running("SteamLaunch AppId=")
-
-    def shutdown(self):
+    def shut_down(self):
         subprocess.run(["steam", "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not self._wait(lambda: not self._running(self.CLIENT), 60):
-            raise SystemExit("Steam didn't shut down within 60 s; nothing was written")
+        stopped = self.wait_for(lambda: not self.process_is_running(self.CLIENT_PROCESS), seconds=60)
+        if not stopped:
+            raise SystemExit("Steam didn't shut down within 60 seconds; nothing was written")
 
-    def wait_until_back(self):
+    def wait_until_running_again(self):
         # Game Mode relaunches Steam by itself; Desktop Mode doesn't.
-        if not self._wait(lambda: self._running(self.CLIENT), 90):
+        started = self.wait_for(lambda: self.process_is_running(self.CLIENT_PROCESS), seconds=90)
+        if not started:
             print("Steam hasn't come back; start it yourself to see the changes")
 
-    def _wait(self, done, seconds):
+    def process_is_running(self, command_line_contains):
+        result = subprocess.run(["pgrep", "-f", command_line_contains], stdout=subprocess.DEVNULL)
+        return result.returncode == 0
+
+    def wait_for(self, condition, seconds):
         deadline = time.time() + seconds
         while time.time() < deadline:
-            if done():
+            if condition():
                 return True
             time.sleep(1)
         return False
 
 
-def main(argv=None):
+def main():
     parser = argparse.ArgumentParser(description="Add or update a non-Steam shortcut and its library art.")
-    parser.add_argument("name", help="name shown in the library")
-    parser.add_argument("exe", help="absolute path to the launcher")
-    parser.add_argument("art_dir", nargs="?", help="folder with cover/capsule/hero/logo/icon.png")
-    parser.add_argument("--userdata", default=os.path.expanduser("~/.local/share/Steam/userdata"))
-    args = parser.parse_args(argv)
-    run(args.name, os.path.abspath(args.exe), args.art_dir, args.userdata, Steam())
+    parser.add_argument("name", help="the name shown in the Steam library")
+    parser.add_argument("exe_path", help="path to the game's launcher")
+    parser.add_argument("art_folder", nargs="?", help="folder holding cover/capsule/hero/logo/icon.png")
+    parser.add_argument("--userdata", default=STEAM_USERDATA_FOLDER, help="Steam's userdata folder")
+    arguments = parser.parse_args()
+    add_to_steam(arguments.name, os.path.abspath(arguments.exe_path), arguments.art_folder,
+                 arguments.userdata, Steam())
 
 
 if __name__ == "__main__":
