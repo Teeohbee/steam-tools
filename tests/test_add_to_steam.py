@@ -118,6 +118,20 @@ class AddToSteamTest(unittest.TestCase):
         self.assertEqual(steam.calls, [])
         self.assertEqual(self.scuttle_shortcut()["AppName"], "Scuttle")
 
+    def test_new_art_refused_while_a_game_is_running_still_shows_on_the_next_run(self):
+        self.add_art("icon")
+        self.add_scuttle(FakeSteam())
+        self.add_art("icon", b"new")
+
+        with self.assertRaises(SystemExit):
+            self.add_scuttle(FakeSteam(game_running=True))
+        self.assertEqual(self.grid_file("%d_icon.png" % SCUTTLE_APPID), b"png")
+
+        steam = FakeSteam()
+        self.add_scuttle(steam)
+        self.assertEqual(steam.calls, ["shut down", "running again"])
+        self.assertEqual(self.grid_file("%d_icon.png" % SCUTTLE_APPID), b"new")
+
 
 if __name__ == "__main__":
     unittest.main()
