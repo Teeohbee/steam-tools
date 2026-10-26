@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Puts a game on a SteamOS device from this Mac: its launcher, game.conf and art go
+# into ~/Games/<NAME>/, then steam_add.py adds it to the Steam library. Safe to run
+# again, to refresh the art or the launcher.
+#
+# Usage: steam-install <host> <game-repo>
+#   <game-repo> holds steam/game.conf (NAME, REPO, BINARY) and optionally steam/art/*.png
+set -euo pipefail
+
+fail() {
+	echo "steam-install: $*" >&2
+	exit 1
+}
+
+if [ $# -ne 2 ]; then
+	echo "usage: steam-install <host> <game-repo>" >&2
+	exit 2
+fi
+host="$1"
+game_repo="$2"
+tools_folder="$(cd "$(dirname "$0")" && pwd)"
+
+game_conf="$game_repo/steam/game.conf"
+[ -f "$game_conf" ] || fail "no steam/game.conf in $game_repo"
+NAME="" REPO="" BINARY=""
+. "$game_conf"
+for setting in NAME REPO BINARY; do
+	[ -n "${!setting}" ] || fail "steam/game.conf doesn't set $setting"
+done
+
+# Paths on the device, relative to its home folder
+game_folder="Games/$NAME"
+tools_folder_on_device=".local/share/steam-tools"
+
+# BatchMode fails straight away rather than asking for a password nobody is there to type
+ssh_options=(-o BatchMode=yes -o ConnectTimeout=10)
+
+echo "Installing $NAME on $host"
+ssh "${ssh_options[@]}" "$host" "mkdir -p $(printf %q "$game_folder/art") $tools_folder_on_device" \
+	|| fail "couldn't reach $host - is it awake?"
+
+scp -q "${ssh_options[@]}" "$tools_folder/launch.sh" "$game_conf" "$host:$game_folder/"
+scp -q "${ssh_options[@]}" "$tools_folder/steam_add.py" "$host:$tools_folder_on_device/"
+
+shopt -s nullglob
+art_files=("$game_repo"/steam/art/*.png)
+art_argument=""
+if [ ${#art_files[@]} -gt 0 ]; then
+	scp -q "${ssh_options[@]}" "${art_files[@]}" "$host:$game_folder/art/"
+	art_argument="~/$(printf %q "$game_folder/art")"
+fi
+
+ssh "${ssh_options[@]}" "$host" "python3 ~/$tools_folder_on_device/steam_add.py \
+	$(printf %q "$NAME") ~/$(printf %q "$game_folder/launch.sh") $art_argument"
