@@ -11,21 +11,18 @@ SCUTTLE_APPID = 2537009592
 
 class FakeSteam:
     """Records what it was asked to do instead of touching a real Steam."""
-    def __init__(self, game_running=False, do_while_shutting_down=None):
+    def __init__(self, game_running=False, do_on_restart=None):
         self.calls = []
         self._game_running = game_running
-        self._do_while_shutting_down = do_while_shutting_down
+        self._do_on_restart = do_on_restart
 
     def is_game_running(self):
         return self._game_running
 
-    def shut_down(self):
-        self.calls.append("shut down")
-        if self._do_while_shutting_down:
-            self._do_while_shutting_down()
-
-    def wait_until_running_again(self):
-        self.calls.append("running again")
+    def restart(self):
+        self.calls.append("restart")
+        if self._do_on_restart:
+            self._do_on_restart()
 
 
 class AddToSteamTest(unittest.TestCase):
@@ -87,15 +84,21 @@ class AddToSteamTest(unittest.TestCase):
         self.add_scuttle(steam)
         self.assertEqual(steam.calls, [])
 
-    def test_a_shortcut_change_is_written_after_steam_has_shut_down(self):
-        # Steam rewrites the file as it exits, so anything written before then is lost.
-        def steam_rewrites_on_exit():
-            with open(self.shortcuts_file, "wb") as file:
-                file.write(SCUTTLE_FILE)
-        steam = FakeSteam(do_while_shutting_down=steam_rewrites_on_exit)
+    def test_the_restarted_steam_reads_the_changed_shortcut(self):
+        # Game Mode relaunches Steam within seconds of it shutting down, so the change
+        # has to be in the file before the restart, not slipped in during it.
+        names_steam_saw = []
+        steam = FakeSteam(do_on_restart=lambda: names_steam_saw.append(self.scuttle_shortcut()["AppName"]))
         self.add_scuttle(steam, name="Scuttle!")
-        self.assertEqual(steam.calls, ["shut down", "running again"])
-        self.assertEqual(self.scuttle_shortcut()["AppName"], "Scuttle!")
+        self.assertEqual(steam.calls, ["restart"])
+        self.assertEqual(names_steam_saw, ["Scuttle!"])
+
+    def test_new_art_is_in_place_before_steam_restarts(self):
+        self.add_art("hero", b"hero")
+        hero_steam_saw = []
+        steam = FakeSteam(do_on_restart=lambda: hero_steam_saw.append(self.grid_file("%d_hero.png" % SCUTTLE_APPID)))
+        self.add_scuttle(steam)
+        self.assertEqual(hero_steam_saw, [b"hero"])
 
     def test_a_backup_is_kept_before_writing(self):
         self.add_scuttle(FakeSteam(), name="Scuttle!")
@@ -109,7 +112,7 @@ class AddToSteamTest(unittest.TestCase):
         self.add_art("icon", b"new")
         steam = FakeSteam()
         self.add_scuttle(steam)
-        self.assertEqual(steam.calls, ["shut down", "running again"])
+        self.assertEqual(steam.calls, ["restart"])
 
     def test_refuses_to_restart_while_a_game_is_running(self):
         steam = FakeSteam(game_running=True)
@@ -129,7 +132,7 @@ class AddToSteamTest(unittest.TestCase):
 
         steam = FakeSteam()
         self.add_scuttle(steam)
-        self.assertEqual(steam.calls, ["shut down", "running again"])
+        self.assertEqual(steam.calls, ["restart"])
         self.assertEqual(self.grid_file("%d_icon.png" % SCUTTLE_APPID), b"new")
 
 

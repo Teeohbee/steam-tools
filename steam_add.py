@@ -298,43 +298,43 @@ def add_to_steam(name, exe_path, art_folder, userdata_folder, steam):
         # written before this check, so a refused run leaves the change for the next one.
         if steam.is_game_running():
             raise SystemExit("a game is running; quit it and run this again so Steam can restart")
+
+        # Write everything before restarting: Game Mode relaunches Steam within seconds,
+        # leaving no gap to write in. Steam writes shortcuts.vdf when its own shortcuts
+        # change (a launch updates LastPlayTime), not when it exits, so the edit survives.
         copy_art_into_grid(art_to_copy, grid_folder)
-        steam.shut_down()
-
         if shortcut_changed:
-            # Steam rewrites shortcuts.vdf as it exits, so our edit is made now, to the file
-            # Steam has just left behind, rather than to the copy we read earlier.
-            document = read_shortcuts_file(shortcuts_file)
-            add_or_update_shortcut(document, name, exe_path, icon_path)
             back_up_and_write_shortcuts_file(shortcuts_file, document)
-
-        steam.wait_until_running_again()
+        steam.restart()
         print("%s (Steam user %s): updated, appid %d" % (name, steam_user_id, appid))
 
 
 class Steam:
     """The real Steam client, driven from an SSH session."""
-    CLIENT_PROCESS = "ubuntu12_32/steam"
     RUNNING_GAME_PROCESS = "SteamLaunch AppId="
 
     def is_game_running(self):
-        return self.process_is_running(self.RUNNING_GAME_PROCESS)
+        result = subprocess.run(["pgrep", "-f", self.RUNNING_GAME_PROCESS], stdout=subprocess.DEVNULL)
+        return result.returncode == 0
 
-    def shut_down(self):
+    def restart(self):
+        old_client = self.client_process_id()
+        if old_client is None:
+            print("Steam isn't running; the changes will show when it starts")
+            return
         subprocess.run(["steam", "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        stopped = self.wait_for(lambda: not self.process_is_running(self.CLIENT_PROCESS), seconds=60)
-        if not stopped:
-            raise SystemExit("Steam didn't shut down within 60 seconds; nothing was written")
-
-    def wait_until_running_again(self):
-        # Game Mode relaunches Steam by itself; Desktop Mode doesn't.
-        started = self.wait_for(lambda: self.process_is_running(self.CLIENT_PROCESS), seconds=90)
-        if not started:
+        # Game Mode relaunches Steam by itself, so it's back when there's a new client process.
+        # Desktop Mode doesn't relaunch it.
+        came_back = self.wait_for(lambda: self.client_process_id() not in (None, old_client), seconds=90)
+        if not came_back:
             print("Steam hasn't come back; start it yourself to see the changes")
 
-    def process_is_running(self, command_line_contains):
-        result = subprocess.run(["pgrep", "-f", command_line_contains], stdout=subprocess.DEVNULL)
-        return result.returncode == 0
+    def client_process_id(self):
+        # Matched by exact process name: Steam's helpers also live under ubuntu12_32/steam*
+        # and outlive the client, so matching the path never sees Steam stop.
+        result = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.PIPE, text=True)
+        process_ids = result.stdout.split()
+        return process_ids[0] if process_ids else None
 
     def wait_for(self, condition, seconds):
         deadline = time.time() + seconds
