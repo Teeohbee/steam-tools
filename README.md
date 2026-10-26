@@ -12,6 +12,17 @@ Adds the non-Steam shortcut for that launcher, or updates the existing one (matc
 
 Standard library only.
 
+## launch.sh (runs on the device)
+
+The game's launcher, and what Steam actually runs. Each game gets its own copy at `~/Games/<Name>/launch.sh` beside a `game.conf`:
+
+```sh
+REPO="Teeohbee/scuttle"
+BINARY="Scuttle.x86_64"
+```
+
+On every launch it checks GitHub for a newer release, downloads it with a progress window (cancelling keeps the build it has), then starts the game. Offline, it runs whatever build is already there.
+
 ## Tests
 
 ```sh
