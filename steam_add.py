@@ -244,28 +244,29 @@ def back_up_and_write_shortcuts_file(shortcuts_file, document):
     os.replace(temporary_file, shortcuts_file)
 
 
-def copy_art_into_grid(art_folder, grid_folder, appid):
-    """Copy cover/capsule/hero/logo/icon.png into Steam's grid folder under Steam's names.
-    Skips missing and unchanged files. Returns the paths it actually wrote."""
-    files_written = []
+def art_needing_copying(art_folder, grid_folder, appid):
+    """Which of cover/capsule/hero/logo/icon.png differ from what's in Steam's grid folder.
+    Skips missing and unchanged files. Returns (source, destination) pairs; copies nothing."""
+    files_to_copy = []
     if art_folder is None:
-        return files_written
+        return files_to_copy
     for role, steam_file_name in ART_FILE_NAMES.items():
         source = os.path.join(art_folder, role + ".png")
         if not os.path.exists(source):
             continue
         destination = os.path.join(grid_folder, steam_file_name.format(appid=appid))
-        with open(source, "rb") as file:
-            new_contents = file.read()
         if os.path.exists(destination):
-            with open(destination, "rb") as file:
-                if file.read() == new_contents:
+            with open(source, "rb") as source_file, open(destination, "rb") as destination_file:
+                if source_file.read() == destination_file.read():
                     continue
-        os.makedirs(grid_folder, exist_ok=True)
-        with open(destination, "wb") as file:
-            file.write(new_contents)
-        files_written.append(destination)
-    return files_written
+        files_to_copy.append((source, destination))
+    return files_to_copy
+
+
+def copy_art_into_grid(files_to_copy, grid_folder):
+    os.makedirs(grid_folder, exist_ok=True)
+    for source, destination in files_to_copy:
+        shutil.copyfile(source, destination)
 
 
 # --- The whole job ------------------------------------------------------------------
@@ -287,16 +288,17 @@ def add_to_steam(name, exe_path, art_folder, userdata_folder, steam):
             icon_path = os.path.join(grid_folder, ART_FILE_NAMES["icon"].format(appid=appid))
 
         shortcut_changed = add_or_update_shortcut(document, name, exe_path, icon_path)
-        art_files_written = copy_art_into_grid(art_folder, grid_folder, appid)
-        art_changed = len(art_files_written) > 0
+        art_to_copy = art_needing_copying(art_folder, grid_folder, appid)
 
-        if not shortcut_changed and not art_changed:
+        if not shortcut_changed and len(art_to_copy) == 0:
             print("%s (Steam user %s): already up to date" % (name, steam_user_id))
             continue
 
-        # Steam only notices changes when it starts, so it has to restart.
+        # Steam only notices changes when it starts, so it has to restart. Nothing is
+        # written before this check, so a refused run leaves the change for the next one.
         if steam.is_game_running():
             raise SystemExit("a game is running; quit it and run this again so Steam can restart")
+        copy_art_into_grid(art_to_copy, grid_folder)
         steam.shut_down()
 
         if shortcut_changed:
