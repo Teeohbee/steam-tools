@@ -162,6 +162,16 @@ def appid_for(document, name, exe_path):
     return checksum | 0x80000000
 
 
+def means_the_same(setting, stored_value, wanted_value):
+    """Paths count as the same with or without quotes or a trailing slash, so a shortcut
+    written by Steam (or by hand) isn't rewritten, and Steam restarted, just to reformat it."""
+    if setting in ("Exe", "StartDir") and stored_value is not None:
+        stored_path = stored_value.strip('"').rstrip("/")
+        wanted_path = wanted_value.strip('"').rstrip("/")
+        return stored_path == wanted_path
+    return stored_value == wanted_value
+
+
 def add_or_update_shortcut(document, name, exe_path, icon_path=None):
     """Make the shortcut for exe_path match these settings. Returns True if anything changed.
     icon_path=None leaves the shortcut's current icon alone."""
@@ -203,7 +213,7 @@ def add_or_update_shortcut(document, name, exe_path, icon_path=None):
     anything_changed = False
     for setting, wanted_value in wanted_settings.items():
         key_as_stored = find_key_ignoring_case(existing_shortcut, setting) or setting
-        if existing_shortcut.get(key_as_stored) != wanted_value:
+        if not means_the_same(setting, existing_shortcut.get(key_as_stored), wanted_value):
             existing_shortcut[key_as_stored] = wanted_value
             anything_changed = True
     return anything_changed

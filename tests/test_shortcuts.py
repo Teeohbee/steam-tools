@@ -28,6 +28,16 @@ class ShortcutTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(steam_add.serialise_vdf(self.document), bytes_after_first_run)
 
+    def test_a_start_dir_written_another_way_is_not_a_change(self):
+        # Scuttle's real shortcut on the Steam Machine has StartDir unquoted, with a trailing slash
+        shortcut = self.document["shortcuts"]["0"]
+        shortcut["StartDir"] = "/home/deck/Games/Scuttle/"
+
+        changed = steam_add.add_or_update_shortcut(self.document, "Scuttle", SCUTTLE_EXE)
+
+        self.assertFalse(changed)
+        self.assertEqual(shortcut["StartDir"], "/home/deck/Games/Scuttle/")
+
     def test_renames_a_shortcut_found_by_its_exe(self):
         changed = steam_add.add_or_update_shortcut(self.document, "Scuttle!", SCUTTLE_EXE)
         self.assertTrue(changed)
